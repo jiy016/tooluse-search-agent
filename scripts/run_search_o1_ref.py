@@ -591,7 +591,10 @@ def main():
                                 results = {}
                     
                         # reflection here? Use judgement and reflection. If judge said we need a reflection, we run the reflection
+                        # ================= Reflection (LLM-powered) =================
                         # >>> ADD/REPLACE START: Judge + Reflection right after results exist
+
+                        MAX_RETRIES = 5
 
                         def _run_search_with_cache(q: str):
                             if q in search_cache:
@@ -607,13 +610,11 @@ def main():
                                 search_cache[q] = {}
                                 return {}
 
-                        # ---------- Judge + Reflection right after results exist ----------
-                        # Mark executed + increment count ONCE
-                        if search_query not in seq["executed_search_queries"]:
-                            seq["executed_search_queries"].add(search_query)
-                            seq["search_count"] = seq.get("search_count", 0) + 1
+                        # IMPORTANT:
+                        # We already have `results` from the initial search above (outside this block).
+                        # So we should NOT re-search the same query here.
 
-                        # Judge
+                        # 1) call the placeholder judge (future merge point)
                         should_continue, judge_prompt = judge_search(
                             search_query=search_query,
                             results=results,
@@ -627,74 +628,70 @@ def main():
                             "judge_prompt": judge_prompt,
                         })
 
-                        # Reflection
-                        # ================= Reflection (LLM-powered) =================
-                        # >>> REPLACE START: Gate 1 (Judge Snippet + Reflection Query Loop)
+                        # 2) Only do reflection/refine if judge says we should
+                        #    (This is what you wanted: keep a dummy judge interface for future merge.)
+                        if should_continue and seq.get("reflection_count", 0) < seq.get("max_reflection_turns", 1):
+                            attempt = 0
+                            while attempt < MAX_RETRIES and seq["search_count"] < MAX_SEARCH_LIMIT:
+                                attempt += 1
 
-                        MAX_RETRIES = 5
-                        attempt = 0
+                                # Use your reflection module to propose ONE new query (or boxed answer)
+                                remaining_searches = max(0, MAX_SEARCH_LIMIT - seq.get("search_count", 0))
+                                search_results_preview = extract_relevant_info(results)[:3]  # short preview to control length
 
-                        def _run_search_with_cache(q: str):
-                            if q in search_cache:
-                                print(f'Using cached search results for query: "{q}"')
-                                return search_cache[q]
-                            try:
-                                r = bing_web_search(q, bing_subscription_key, bing_endpoint, market='en-US', language='en')
-                                search_cache[q] = r
-                                print(f'Executed and cached search for query: "{q}"')
-                                return r
-                            except Exception as e:
-                                print(f"Error during search query '{q}': {e}")
-                                search_cache[q] = {}
-                                return {}
+                                new_q = run_reflection(
+                                    llm,
+                                    tokenizer,
+                                    question=seq['item']['Question'],
+                                    current_reasoning=seq['history'][-1] if seq['history'] else "",
+                                    judge_prompt=judge_prompt,
+                                    last_search_query=search_query,
+                                    search_results_preview=search_results_preview,
+                                    remaining_searches=remaining_searches,
+                                )
 
-                        # IMPORTANT: do NOT increment search_count here yet; only when final query accepted
-                        while attempt < MAX_RETRIES:
-                            attempt += 1
+                                seq.setdefault("reflection_trace", [])
+                                seq["reflection_trace"].append({
+                                    "attempt": attempt,
+                                    "old_query": search_query,
+                                    "judge_prompt": judge_prompt,
+                                    "new_query": new_q,
+                                })
 
-                            # (re)search
-                            results = _run_search_with_cache(search_query)
-                            if search_query not in seq["executed_search_queries"]:
+                                if not new_q:
+                                    break
+                                if new_q == search_query:
+                                    # No change -> stop to avoid loops
+                                    break
+                                if new_q in seq["executed_search_queries"]:
+                                    # already executed -> stop to avoid loops
+                                    break
+
+                                # Execute the new query
+                                search_query = new_q
+                                results = _run_search_with_cache(search_query)
+
+                                # Count this new unique query
                                 seq["executed_search_queries"].add(search_query)
                                 seq["search_count"] = seq.get("search_count", 0) + 1
 
-                            # judge snippet relevance (Gate 1)
-                            relevant_check = extract_relevant_info(results)
-                            is_relevant, reason = run_judge_snippet(
-                                llm,
-                                tokenizer,
-                                seq['item']['Question'],
-                                seq['history'][-1] if seq['history'] else "",
-                                search_query,
-                                relevant_check
-                            )
-
-                            if is_relevant:
-                                print("Search query is relevant.")
-                                break
-
-                            print(f"Judge Rejected: {reason}")
-
-                            # reflect to propose a new query
-                            if attempt < MAX_RETRIES:
-                                new_q = run_reflection_query(
-                                    llm,
-                                    tokenizer,
-                                    seq['item']['Question'],
-                                    seq['history'][-1] if seq['history'] else "",
-                                    search_query,
-                                    reason
+                                # Optional: update judge_prompt for next attempt (keep interface stable)
+                                should_continue, judge_prompt = judge_search(
+                                    search_query=search_query,
+                                    results=results,
+                                    seq=seq
                                 )
-                                if new_q and new_q != search_query:
-                                    print(f"Gate 1 Refinement: '{search_query}' -> '{new_q}'")
-                                    search_query = new_q
-                                    continue
+                                seq["judge_trace"].append({
+                                    "search_query": search_query,
+                                    "should_continue": bool(should_continue),
+                                    "judge_prompt": judge_prompt,
+                                })
 
-                            # if cannot get a better query, stop retrying
-                            break
+                                if not should_continue:
+                                    break
 
-                        # >>> REPLACE END: Gate 1
-                        # ============================================================
+                            seq["reflection_count"] = seq.get("reflection_count", 0) + 1
+
                         # >>> ADD/REPLACE END
 
 
