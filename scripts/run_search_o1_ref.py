@@ -614,8 +614,13 @@ def main():
                         # We already have `results` from the initial search above (outside this block).
                         # So we should NOT re-search the same query here.
 
+                        # Count this initial executed search (important!)
+                        if search_query not in seq["executed_search_queries"]:
+                            seq["executed_search_queries"].add(search_query)
+                            seq["search_count"] = seq.get("search_count", 0) + 1
+
                         # 1) call the placeholder judge (future merge point)
-                        should_continue, judge_prompt = judge_search(
+                        should_reflect, judge_prompt = judge_search(
                             search_query=search_query,
                             results=results,
                             seq=seq
@@ -624,13 +629,13 @@ def main():
                         seq.setdefault("judge_trace", [])
                         seq["judge_trace"].append({
                             "search_query": search_query,
-                            "should_continue": bool(should_continue),
+                            "should_reflect": bool(should_reflect),
                             "judge_prompt": judge_prompt,
                         })
 
                         # 2) Only do reflection/refine if judge says we should
                         #    (This is what you wanted: keep a dummy judge interface for future merge.)
-                        if should_continue and seq.get("reflection_count", 0) < seq.get("max_reflection_turns", 1):
+                        if should_reflect and seq.get("reflection_count", 0) < seq.get("max_reflection_turns", 1):
                             attempt = 0
                             while attempt < MAX_RETRIES and seq["search_count"] < MAX_SEARCH_LIMIT:
                                 attempt += 1
@@ -676,18 +681,18 @@ def main():
                                 seq["search_count"] = seq.get("search_count", 0) + 1
 
                                 # Optional: update judge_prompt for next attempt (keep interface stable)
-                                should_continue, judge_prompt = judge_search(
+                                should_reflect, judge_prompt = judge_search(
                                     search_query=search_query,
                                     results=results,
                                     seq=seq
                                 )
                                 seq["judge_trace"].append({
                                     "search_query": search_query,
-                                    "should_continue": bool(should_continue),
+                                    "should_reflect": bool(should_reflect),
                                     "judge_prompt": judge_prompt,
                                 })
 
-                                if not should_continue:
+                                if not should_reflect:
                                     break
 
                             seq["reflection_count"] = seq.get("reflection_count", 0) + 1
