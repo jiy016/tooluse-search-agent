@@ -1,185 +1,233 @@
-# reflection.py
-
-from typing import Dict, Any, Optional, List
-import re
-import json
-
 from vllm import SamplingParams
 
-from prompts import get_search_o1_reflection_instruction_v2
+# ===========================
+#        PROMPTS
+# ===========================
 
-BEGIN_SEARCH_QUERY = "<|begin_search_query|>"
-END_SEARCH_QUERY = "<|end_search_query|>"
+JUDGE_SNIPPET_PROMPT = """
+You are a relevance evaluator.
+User Question: {question}
+Search Query Used: {query}
+Search Results (Snippets):
+{snippets}
+
+Task: Do these snippets appear RELEVANT and helpful for the search query?
+- If YES, output exactly: "JUDGEMENT: YES"
+- If NO, output exactly: "JUDGEMENT: NO | Reason: [Short explanation of why it failed]"
+
+Example of NO: "JUDGEMENT: NO | Reason: The results are about fruit apple, but the user asked about Apple Inc. tech."
+"""
+
+#### FOR REFLECTION
+REFLECTION_QUERY_PROMPT = """
+The previous search query failed.
+User Question: {question}
+Failed Query: {query}
+Judge's Complaint: {reason}
+
+Task: Write a NEW, better search query that specifically addresses the Judge's complaint.
+Output Format:
+Reasoning: [How I will fix the error]
+New_Query: [The new query string]
+"""
+#### FOR REFLECTION
 
 
-def _extract_between(text: str, start_tag: str, end_tag: str) -> Optional[str]:
-    pattern = re.escape(start_tag) + r"(.*?)" + re.escape(end_tag)
-    matches = re.findall(pattern, text, flags=re.DOTALL)
-    if matches:
-        return matches[-1].strip()
+PRESENCE_CHECK_PROMPT = """
+You are a Fact Validator.
+User Query: "{search_query}"
+Search Results:
+"{document_text}"
+
+Task: Determine if the answer to the query is present ANYWHERE in these search results.
+- If the text contains specific facts, numbers, or names that answer the query, output "STATUS: PRESENT".
+- If the text is irrelevant or does not contain the answer, output "STATUS: ABSENT".
+"""
+
+REFINE_EXTRACTION_PROMPT = """
+You previously missed the information in these documents.
+User Query: "{search_query}"
+Search Results:
+"{document_text}"
+
+Validator Note: The answer IS present in these results.
+
+Task: Read the results again carefully and extract the EXACT answer to the query.
+- Start your response with "**Final Information**" followed by the extracted facts.
+- If you still cannot find it (despite the note), output "No helpful information found."
+"""
+
+JUDGE_CONTENT_PROMPT = """
+You are evaluating if a search result was successful.
+
+Search Query Used: {search_query}
+Reasoning Context: ...{history}...
+Extracted Information: {info}
+
+Task: Did this search successfully find the information requested in the **Search Query**?
+(Do NOT judge based on whether it fully answers the ultimate user question, only if it satisfied the immediate search intent.)
+
+- If the search query asked for "CEO name" and the text contains "Tim Cook", say YES.
+- If the text is irrelevant to the query, say NO.
+
+Output format:
+"JUDGEMENT: YES" 
+or 
+"JUDGEMENT: NO | Reason: [Explain exactly what is missing]"
+"""
+
+REFLECTION_CONTENT_PROMPT = """
+The extracted information was judged as INSUFFICIENT to answer the search query.
+User Question: {question}
+Search Query: {search_query}
+Judge's Verdict: {reason}
+Current Info: {info}
+
+Task:
+1. Analyze what specific information is still missing.
+2. Propose a high-level SEARCH DIRECTION or STRATEGY to find this missing information.
+
+Output Format:
+Analysis: [What is missing]
+Search_Direction: [Strategic advice for the next step]
+"""
+
+HALLUCINATION_CHECK_PROMPT = """
+You are a Fact Checker.
+User Question: {question}
+Proposed Final Answer: {final_answer}
+
+Task: Does this answer contain specific factual claims (dates, numbers, names) that appear UNVERIFIED or possibly hallucinated given the context?
+- If the answer is safe or generic, say NO.
+- If the answer makes specific claims without clear evidence in reasoning history, say YES.
+
+Output exactly: "JUDGEMENT: YES" or "JUDGEMENT: NO"
+"""
+
+# ===========================
+#    LOGIC FUNCTIONS
+# ===========================
+
+def run_judge_snippet(llm, tokenizer, question, history, query, results):
+    """Gate 1: Checks search snippet relevance."""
+    snippets = "\n".join([f"- {r.get('snippet', '')[:150]}" for r in results[:5]])
+    history_short = history[-500:] if history else ""
+    
+    prompt_content = JUDGE_SNIPPET_PROMPT.format(
+        question=question, history=history_short, query=query, snippets=snippets
+    )
+    
+    messages = [{"role": "user", "content": prompt_content}]
+    text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    output = llm.generate([text_input], sampling_params=SamplingParams(max_tokens=500, temperature=0.1))
+    response = output[0].outputs[0].text
+    
+    if "JUDGEMENT: YES" in response:
+        return True, None
+    elif "JUDGEMENT: NO" in response:
+        try: reason = response.split("| Reason:")[1].strip()
+        except: reason = "Results appeared irrelevant."
+        return False, reason
+    return True, None 
+
+def run_reflection_query(llm, tokenizer, question, history, failed_query, failure_reason):
+    """Gate 1 Reflector: Generates new query."""
+    history_short = history[-500:] if history else ""
+    prompt_content = REFLECTION_QUERY_PROMPT.format(
+        question=question, history=history_short, query=failed_query, reason=failure_reason
+    )
+    
+    messages = [{"role": "user", "content": prompt_content}]
+    text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    output = llm.generate([text_input], sampling_params=SamplingParams(max_tokens=100, temperature=0.7))
+    response = output[0].outputs[0].text
+    
+    if "New_Query:" in response:
+        try: return response.split("New_Query:")[1].strip().split('\n')[0]
+        except: return None
     return None
 
-
-def _extract_boxed(text: str) -> Optional[str]:
-    # Extract \boxed{...} including nested newlines (best-effort)
-    m = re.search(r"\\boxed\{([\s\S]*?)\}", text)
-    if m:
-        return m.group(0).strip()
-    return None
-
-
-def _build_results_preview(search_results: Any, max_items: int = 3, max_chars: int = 1500) -> str:
-    """
-    search_results can be:
-    - list[dict] (already extracted_relevant_info preview)
-    - dict (raw bing result)
-    This function is defensive; it won't crash.
-    """
-    try:
-        if isinstance(search_results, list):
-            items = search_results[:max_items]
-            lines: List[str] = []
-            for i, it in enumerate(items, 1):
-                title = str(it.get("title", "")) if isinstance(it, dict) else ""
-                url = str(it.get("url", "")) if isinstance(it, dict) else ""
-                snippet = str(it.get("snippet", "")) if isinstance(it, dict) else ""
-                lines.append(f"[{i}] title={title}\nurl={url}\nsnippet={snippet}")
-            preview = "\n\n".join(lines).strip()
-        elif isinstance(search_results, dict):
-            # best effort for bing schema: search_results.get("webPages", {}).get("value", [])
-            values = []
-            wp = search_results.get("webPages", {})
-            if isinstance(wp, dict):
-                values = wp.get("value", []) or []
-            values = values[:max_items]
-            lines = []
-            for i, it in enumerate(values, 1):
-                if not isinstance(it, dict):
-                    continue
-                lines.append(
-                    f"[{i}] title={it.get('name','')}\n"
-                    f"url={it.get('url','')}\n"
-                    f"snippet={it.get('snippet','')}"
-                )
-            preview = "\n\n".join(lines).strip()
-        else:
-            preview = str(search_results)[:max_chars]
-    except Exception:
-        preview = "(failed to build preview)"
-
-    if len(preview) > max_chars:
-        preview = preview[:max_chars] + " ..."
-    return preview
-
-
-def run_reflection(
-    llm,
-    tokenizer,
-    judge_prompt: str,
-    *,
-    question: str,
-    current_reasoning: str,
-    search_query: str,
-    search_results_preview: Any,
-    seq: Dict[str, Any],
-    remaining_searches: int,
-    max_suggested_queries: int = 1,
-    temperature: float = 0.2,
-    top_p: float = 0.9,
-    top_k: int = 20,
-    max_tokens: int = 512,
-) -> Dict[str, Any]:
-    """
-    LLM-powered reflection.
-
-    Returns a dict with optional fields:
-    - "new_search_query": Optional[str]
-    - "reflection_note": str
-    - "should_append_to_history": bool
-    - "history_item": Optional[dict]
-    - "stop": bool
-    - "final_answer": Optional[str] (boxed)
-    """
-
-    preview_text = _build_results_preview(search_results_preview)
-
-    # Build prompt from prompts.py
-    user_prompt = get_search_o1_reflection_instruction_v2(
-        question=question,
-        current_reasoning=current_reasoning,
-        judge_prompt=judge_prompt,
-        last_search_query=search_query,
-        search_results_preview=preview_text,
-        remaining_searches=remaining_searches,
+def run_presence_check(llm, tokenizer, search_query, document_text):
+    """Checks if info exists in the batch of docs (Boolean check)."""
+    # Truncate to ~30k chars (approx 7-8k tokens) to fit in context while covering most docs
+    short_doc = document_text[:30000] 
+    prompt_content = PRESENCE_CHECK_PROMPT.format(
+        search_query=search_query, 
+        document_text=short_doc
     )
+    
+    messages = [{"role": "user", "content": prompt_content}]
+    text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    output = llm.generate([text_input], sampling_params=SamplingParams(max_tokens=10, temperature=0.1))
+    response = output[0].outputs[0].text
+    
+    return "STATUS: PRESENT" in response
 
-    # vLLM expects plain text prompts; we use chat template like the rest of your script
-    chat = [{"role": "user", "content": user_prompt}]
-    prompt_str = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-
-    out = llm.generate(
-        [prompt_str],
-        sampling_params=SamplingParams(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            repetition_penalty=1.05,
-            stop=[END_SEARCH_QUERY, tokenizer.eos_token],
-            include_stop_str_in_output=True,
-        )
+def run_refine_extraction(llm, tokenizer, search_query, document_text):
+    """Forces a re-read of the documents."""
+    # Use a larger window (35k chars) to ensure we see all 10 snippets
+    prompt_content = REFINE_EXTRACTION_PROMPT.format(
+        search_query=search_query, 
+        document_text=document_text[:35000] 
     )
+    
+    messages = [{"role": "user", "content": prompt_content}]
+    text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    # Increase max_tokens slightly to allow for a full explanation
+    output = llm.generate([text_input], sampling_params=SamplingParams(max_tokens=1500, temperature=0.5))
+    return output[0].outputs[0].text
 
-    raw_text = out[0].outputs[0].text if out and out[0].outputs else ""
-    new_q = _extract_between(raw_text, BEGIN_SEARCH_QUERY, END_SEARCH_QUERY)
-
-    final_boxed = _extract_boxed(raw_text)
-
-    # Build reflection note (for debug)
-    reflection_note = (
-        "[Reflection-LLM]\n"
-        f"Judge said:\n{judge_prompt}\n\n"
-        f"Last query: {search_query}\n"
-        f"Raw reflection output:\n{raw_text}\n"
+def run_judge_content(llm, tokenizer, question, search_query, history, extracted_info):
+    """Gate 2: Checks content sufficiency."""
+    history_short = history[-500:] if history else ""
+    prompt_content = JUDGE_CONTENT_PROMPT.format(
+        search_query=search_query, 
+        history=history_short, 
+        info=extracted_info[:2000]
     )
+    
+    messages = [{"role": "user", "content": prompt_content}]
+    text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    output = llm.generate([text_input], sampling_params=SamplingParams(max_tokens=100, temperature=0.1))
+    response = output[0].outputs[0].text
+    
+    if "JUDGEMENT: YES" in response:
+        return True, None
+    else:
+        try: reason = response.split("| Reason:")[1].strip()
+        except: reason = "Information was too vague or incomplete."
+        return False, reason
 
-    result: Dict[str, Any] = {
-        "new_search_query": None,
-        "final_answer": None,
-        "reflection_note": reflection_note,
-        "should_append_to_history": False,
-        "history_item": {"role": "system", "content": reflection_note},
-        "stop": False,
-    }
+def run_reflection_content(llm, tokenizer, question, search_query, extracted_info, failure_reason):
+    """Gate 2 Reflector: Generates search direction."""
+    prompt_content = REFLECTION_CONTENT_PROMPT.format(
+        question=question, 
+        search_query=search_query,
+        info=extracted_info[:1000], 
+        reason=failure_reason
+    )
+    
+    messages = [{"role": "user", "content": prompt_content}]
+    text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    output = llm.generate([text_input], sampling_params=SamplingParams(max_tokens=300, temperature=0.7))
+    return output[0].outputs[0].text.strip()
 
-    # Priority: if boxed exists and no new query tag -> stop
-    if final_boxed and not new_q:
-        result["final_answer"] = final_boxed
-        result["stop"] = True
-        return result
-
-    # If model proposes a query, enforce max_suggested_queries and basic sanity
-    if new_q and max_suggested_queries > 0:
-        new_q = new_q.strip()
-        # Avoid empty / same query loops
-        if new_q and new_q != search_query:
-            result["new_search_query"] = new_q
-
-    return result
-
-
-def apply_reflection_to_seq(seq: Dict[str, Any], reflection_out: Dict[str, Any]) -> None:
-    """
-    Apply reflection output to seq state (mutates seq).
-    """
-    seq.setdefault("reflection_trace", [])
-    seq["reflection_trace"].append({
-        "reflection_note": reflection_out.get("reflection_note"),
-        "new_search_query": reflection_out.get("new_search_query"),
-        "final_answer": reflection_out.get("final_answer"),
-        "stop": bool(reflection_out.get("stop", False)),
-    })
-
-    if reflection_out.get("should_append_to_history") and reflection_out.get("history_item") is not None:
-        seq.setdefault("messages", [])
-        seq["messages"].append(reflection_out["history_item"])
+def run_hallucination_check(llm, tokenizer, question, final_answer):
+    """Post-Hoc Check: Checks for uncited claims."""
+    prompt_content = HALLUCINATION_CHECK_PROMPT.format(
+        question=question, final_answer=final_answer[:2000]
+    )
+    
+    messages = [{"role": "user", "content": prompt_content}]
+    text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    output = llm.generate([text_input], sampling_params=SamplingParams(max_tokens=50, temperature=0.1))
+    response = output[0].outputs[0].text
+    
+    return "JUDGEMENT: YES" in response

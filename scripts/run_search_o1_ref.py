@@ -36,11 +36,44 @@ from prompts import (
     get_task_instruction_code, 
     get_search_o1_reflection_instruction, 
 )
-from reflection import run_reflection, apply_reflection_to_seq
-# from judge import judge_search # Judge function here
-def judge_search(*, search_query, results, seq): # dummy function for now
-    # 临时：默认不继续反思，避免死循环
-    return False, "Default judge: stop."
+from reflection import (
+    run_judge_snippet,
+    run_reflection_query,
+    run_judge_content,
+    run_reflection_content,
+    run_presence_check,
+    run_refine_extraction,
+    run_hallucination_check,
+)
+# dummy judge funtion
+def judge_search(*, search_query: str, results: dict, seq: dict):
+    """
+    Return:
+      should_reflect (bool): True -> call reflection to improve query
+      reason (str): short reasoning for reflection prompt
+    """
+    # avoid repeating query
+    if search_query in seq.get("executed_search_queries", set()):
+        return False, "This search query was already executed. Do not reflect to avoid loops."
+
+    # if snippet/title overlaps a lot
+    q = (seq.get("item", {}).get("Question", "") or "").lower()
+    q_tokens = set([t for t in re.findall(r"[a-z0-9]+", q) if len(t) >= 4])
+
+    hits = 0
+    try:
+        preview = extract_relevant_info(results)[:5]
+        for it in preview:
+            text = (it.get("title", "") + " " + it.get("snippet", "")).lower()
+            if any(tok in text for tok in list(q_tokens)[:10]):
+                hits += 1
+    except Exception:
+        pass
+
+    if hits >= 1:
+        return False, "Search snippets look relevant; proceed without reflection."
+    else:
+        return True, "Search snippets seem not relevant to the question; please refine the search query."
 
 # Define special tokens
 BEGIN_SEARCH_QUERY = "<|begin_search_query|>"
@@ -576,8 +609,9 @@ def main():
 
                         # ---------- Judge + Reflection right after results exist ----------
                         # Mark executed + increment count ONCE
-                        seq['executed_search_queries'].add(search_query)
-                        seq['search_count'] = seq.get('search_count', 0) + 1
+                        if search_query not in seq["executed_search_queries"]:
+                            seq["executed_search_queries"].add(search_query)
+                            seq["search_count"] = seq.get("search_count", 0) + 1
 
                         # Judge
                         should_continue, judge_prompt = judge_search(
@@ -595,50 +629,71 @@ def main():
 
                         # Reflection
                         # ================= Reflection (LLM-powered) =================
-                        if should_continue and seq.get("reflection_count", 0) < seq.get("max_reflection_turns", 1):
-                            seq["reflection_count"] = seq.get("reflection_count", 0) + 1
+                        # >>> REPLACE START: Gate 1 (Judge Snippet + Reflection Query Loop)
 
-                            # 1. 给 reflection 用的 search 结果预览（防止 prompt 太长）
-                            preview_for_reflection = extract_relevant_info(results)[:3]
+                        MAX_RETRIES = 5
+                        attempt = 0
 
-                            # 2. 计算剩余 search 次数（给 prompt 用）
-                            remaining_searches = max(0, MAX_SEARCH_LIMIT - seq.get("search_count", 0))
+                        def _run_search_with_cache(q: str):
+                            if q in search_cache:
+                                print(f'Using cached search results for query: "{q}"')
+                                return search_cache[q]
+                            try:
+                                r = bing_web_search(q, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                search_cache[q] = r
+                                print(f'Executed and cached search for query: "{q}"')
+                                return r
+                            except Exception as e:
+                                print(f"Error during search query '{q}': {e}")
+                                search_cache[q] = {}
+                                return {}
 
-                            # 3. 调用真正的 reflection（用 prompts + LLM）
-                            reflection_out = run_reflection(
+                        # IMPORTANT: do NOT increment search_count here yet; only when final query accepted
+                        while attempt < MAX_RETRIES:
+                            attempt += 1
+
+                            # (re)search
+                            results = _run_search_with_cache(search_query)
+                            if search_query not in seq["executed_search_queries"]:
+                                seq["executed_search_queries"].add(search_query)
+                                seq["search_count"] = seq.get("search_count", 0) + 1
+
+                            # judge snippet relevance (Gate 1)
+                            relevant_check = extract_relevant_info(results)
+                            is_relevant, reason = run_judge_snippet(
                                 llm,
                                 tokenizer,
-                                judge_prompt,
-                                question=seq["item"]["Question"],          # 原始问题
-                                current_reasoning=seq.get("output", "")[-4000:],  # 当前推理（截断）
-                                search_query=search_query,
-                                search_results_preview=preview_for_reflection,
-                                seq=seq,
-                                remaining_searches=remaining_searches,
-                                max_suggested_queries=1,
+                                seq['item']['Question'],
+                                seq['history'][-1] if seq['history'] else "",
+                                search_query,
+                                relevant_check
                             )
-                            apply_reflection_to_seq(seq, reflection_out)
 
-                            # 4. 如果 reflection 直接给了最终答案（boxed），立刻结束
-                            if reflection_out.get("stop") and reflection_out.get("final_answer"):
-                                final_ans = reflection_out["final_answer"]
-                                seq["output"] += "\n" + final_ans + "\n"
-                                seq["history"].append(final_ans)
-                                seq["finished"] = True
-                                continue   # 直接进入下一条 sequence
+                            if is_relevant:
+                                print("Search query is relevant.")
+                                break
 
-                            # 5. 如果 reflection 给了新的 search query，就立刻再搜一次
-                            new_q = reflection_out.get("new_search_query")
-                            if new_q and new_q != search_query:
-                                if (
-                                    seq["search_count"] < MAX_SEARCH_LIMIT
-                                    and new_q not in seq["executed_search_queries"]
-                                ):
+                            print(f"Judge Rejected: {reason}")
+
+                            # reflect to propose a new query
+                            if attempt < MAX_RETRIES:
+                                new_q = run_reflection_query(
+                                    llm,
+                                    tokenizer,
+                                    seq['item']['Question'],
+                                    seq['history'][-1] if seq['history'] else "",
+                                    search_query,
+                                    reason
+                                )
+                                if new_q and new_q != search_query:
+                                    print(f"Gate 1 Refinement: '{search_query}' -> '{new_q}'")
                                     search_query = new_q
-                                    results = _run_search_with_cache(search_query)
+                                    continue
 
-                                    seq["executed_search_queries"].add(search_query)
-                                    seq["search_count"] = seq.get("search_count", 0) + 1
+                            # if cannot get a better query, stop retrying
+                            break
+
+                        # >>> REPLACE END: Gate 1
                         # ============================================================
                         # >>> ADD/REPLACE END
 
